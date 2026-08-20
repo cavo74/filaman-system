@@ -1,0 +1,32 @@
+services:
+  filaman:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      SECRET_KEY: ${SECRET_KEY}
+      CSRF_SECRET_KEY: ${CSRF_SECRET_KEY}
+      DATABASE_URL: sqlite+aiosqlite:////app/data/filaman.db
+      DEBUG: "false"
+      ADMIN_EMAIL: ${ADMIN_EMAIL}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD}
+    volumes:
+      - filaman_data:/app/data
+    networks:
+      - web
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=web"
+      - "traefik.http.routers.filaman.rule=Host(`${PUBLIC_DOMAIN}`)"
+      - "traefik.http.routers.filaman.entrypoints=websecure"
+      - "traefik.http.routers.filaman.tls=true"
+      - "traefik.http.routers.filaman.tls.certresolver=myresolver"
+      - "traefik.http.services.filaman.loadbalancer.server.port=8000"
+
+networks:
+  web:
+    external: true
+
+volumes:
+  filaman_data:
