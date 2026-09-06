@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import select, update, func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -129,6 +130,7 @@ class SpoolService:
         user_id: int | None = None,
         device_id: int | None = None,
         source: str | None = None,
+        source_event_key: str | None = None,
         delta_weight_g: float | None = None,
         measured_weight_g: float | None = None,
         from_status_id: int | None = None,
@@ -145,6 +147,7 @@ class SpoolService:
             user_id=user_id,
             device_id=device_id,
             source=source,
+            source_event_key=source_event_key,
             delta_weight_g=delta_weight_g,
             measured_weight_g=measured_weight_g,
             from_status_id=from_status_id,
@@ -363,16 +366,34 @@ class SpoolService:
         principal: Principal | None = None,
         source: str = "ui",
         note: str | None = None,
+        source_event_key: str | None = None,
     ) -> tuple[SpoolEvent, float | None]:
         if delta_weight_g > 0:
             delta_weight_g = -delta_weight_g
 
+        # External producers can replay a completion event after reconnect or
+        # restart.  Resolve the stable key before aggregation so a replay is a
+        # strict no-op and never changes the spool twice.
+        if source_event_key:
+            result = await self.db.execute(
+                select(SpoolEvent).where(
+                    SpoolEvent.source_event_key == source_event_key
+                )
+            )
+            existing_by_key = result.scalar_one_or_none()
+            if existing_by_key is not None:
+                return existing_by_key, spool.remaining_weight_g
+
         # Check if we can aggregate with a recent event
-        existing_event = await self._get_aggregatable_consumption_event(
-            spool_id=spool.id,
-            source=source,
-            current_time=event_at,
-        )
+        existing_event = None
+        # Keyed external events must remain one row per key. Aggregating them
+        # would discard the second key and make a later replay charge again.
+        if not source_event_key:
+            existing_event = await self._get_aggregatable_consumption_event(
+                spool_id=spool.id,
+                source=source,
+                current_time=event_at,
+            )
 
         if existing_event is not None:
             # Aggregate: update existing event instead of creating new one
@@ -416,17 +437,32 @@ class SpoolService:
         meta: dict[str, Any] = {}
 
         if spool.remaining_weight_g is None:
-            event = await self._create_event(
-                spool_id=spool.id,
-                event_type="print_consumption",
-                event_at=event_at,
-                user_id=principal.user_id if principal else None,
-                device_id=principal.device_id if principal else None,
-                source=source,
-                delta_weight_g=delta_weight_g,
-                note=note,
-                meta=meta if meta else None,
-            )
+            try:
+                event = await self._create_event(
+                    spool_id=spool.id,
+                    event_type="print_consumption",
+                    event_at=event_at,
+                    user_id=principal.user_id if principal else None,
+                    device_id=principal.device_id if principal else None,
+                    source=source,
+                    delta_weight_g=delta_weight_g,
+                    note=note,
+                    meta=meta if meta else None,
+                    source_event_key=source_event_key,
+                )
+            except IntegrityError:
+                if not source_event_key:
+                    raise
+                await self.db.rollback()
+                duplicate = await self.db.execute(
+                    select(SpoolEvent).where(
+                        SpoolEvent.source_event_key == source_event_key
+                    )
+                )
+                existing = duplicate.scalar_one_or_none()
+                if existing is None:
+                    raise
+                return existing, None
             await self.db.commit()
             return event, None
 
@@ -438,17 +474,33 @@ class SpoolService:
             meta["clamped_to_zero"] = True
             clamped = True
 
-        event = await self._create_event(
-            spool_id=spool.id,
-            event_type="print_consumption",
-            event_at=event_at,
-            user_id=principal.user_id if principal else None,
-            device_id=principal.device_id if principal else None,
-            source=source,
-            delta_weight_g=delta_weight_g,
-            note=note,
-            meta=meta if meta else None,
-        )
+        try:
+            event = await self._create_event(
+                spool_id=spool.id,
+                event_type="print_consumption",
+                event_at=event_at,
+                user_id=principal.user_id if principal else None,
+                device_id=principal.device_id if principal else None,
+                source=source,
+                delta_weight_g=delta_weight_g,
+                note=note,
+                meta=meta if meta else None,
+                source_event_key=source_event_key,
+            )
+        except IntegrityError:
+            if not source_event_key:
+                raise
+            await self.db.rollback()
+            duplicate = await self.db.execute(
+                select(SpoolEvent).where(
+                    SpoolEvent.source_event_key == source_event_key
+                )
+            )
+            existing = duplicate.scalar_one_or_none()
+            if existing is None:
+                raise
+            fresh_spool = await self.db.get(Spool, spool.id)
+            return existing, fresh_spool.remaining_weight_g if fresh_spool else None
 
         spool.remaining_weight_g = remaining
         spool.last_used_at = event_at
@@ -681,3 +733,4 @@ class SpoolService:
 
         await self.db.commit()
         return remaining
+

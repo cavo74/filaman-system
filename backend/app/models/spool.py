@@ -114,6 +114,11 @@ class SpoolEvent(Base):
     )
 
     source: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    # Stable external event identity (for example Bambuddy's print/spool/tray
+    # key).  Nullable keeps existing/manual events fully backwards compatible.
+    source_event_key: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, unique=True, index=True
+    )
     delta_weight_g: Mapped[float | None] = mapped_column(Float, nullable=True)
     measured_weight_g: Mapped[float | None] = mapped_column(Float, nullable=True)
 
@@ -159,3 +164,4 @@ from app.models.location import Location
 from app.models.printer import PrinterSlotAssignment, PrinterSlotEvent
 from app.models.printer_params import SpoolPrinterParam
 from app.models.user import User
+
