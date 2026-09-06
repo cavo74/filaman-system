@@ -1,6 +1,42 @@
 {
   "versions": [
     {
+      "version": "1.2.49",
+      "date": "",
+      "changes": {
+        "de": [
+          { "type": "feature", "text": "Die Suche auf der Spulenseite findet jetzt auch Spulen anhand ihrer ID (auch mit vorangestelltem \"#\") sowie anhand der Werte ihrer Extrafelder." }
+        ],
+        "en": [
+          { "type": "feature", "text": "The search on the spools page now also finds spools by their ID (with or without a leading \"#\") and by the values of their extra fields." }
+        ]
+      }
+    },
+    {
+      "version": "1.2.45",
+      "date": "",
+      "changes": {
+        "de": [
+          { "type": "feature", "text": "Beim Öffnen einer Plugin-Seite (z. B. über die Seitenleiste oder unter Admin > Plugins) bleibt jetzt die Navigations-Sidebar sichtbar, statt dass die Plugin-Seite das gesamte Fenster ersetzt und die Navigation verschwindet. Plugin-Seiten laufen dabei jetzt zusätzlich in einer Sandbox, sodass sie das übergeordnete Fenster nicht mehr übernehmen können. (Beigetragen von Niko11111)" }
+        ],
+        "en": [
+          { "type": "feature", "text": "Opening a plugin page (e.g. from the sidebar or from Admin > Plugins) now keeps the app's navigation sidebar visible instead of the plugin page replacing the whole window and losing the navigation. Plugin pages are also now sandboxed, so they can no longer take over the top-level window. (Contributed by Niko11111)" }
+        ]
+      }
+    },
+    {
+      "version": "1.2.44",
+      "date": "",
+      "changes": {
+        "de": [
+          { "type": "fix", "text": "Wenn eine Treiber-Aktion (z. B. \"Spule einer Ace-/AMS-Tray zuweisen\", Drucker-Treiber starten/stoppen) an einen anderen Backend-Prozess weitergeleitet werden musste und dessen Antwort nicht als JSON gelesen werden konnte, führte das zu einem unbehandelten 500-Fehler ohne Fehlermeldung. Solche Fälle liefern jetzt einen strukturierten Fehler statt eines rohen Absturzes." }
+        ],
+        "en": [
+          { "type": "fix", "text": "When a driver action (e.g. \"assign a spool to an Ace/AMS tray\", starting/stopping a printer driver) had to be forwarded to another backend process and its response couldn't be read as JSON, this caused an unhandled 500 error with no error body. Such cases now return a structured error instead of a raw crash." }
+        ]
+      }
+    },
+    {
       "version": "1.2.43",
       "date": "",
       "changes": {
