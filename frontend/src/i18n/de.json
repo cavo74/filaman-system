@@ -612,7 +612,15 @@
     "importFromTagNoDevices": "Keine aktiven Geräte verfügbar. Bitte Gerät einschalten und verbinden.",
     "importFromTagNoMatch": "Kein passendes Filament gefunden für",
     "importFromTagMatched": "Filament erkannt",
-    "importFromTagSelectManually": "Bitte Filament manuell auswählen"
+    "importFromTagSelectManually": "Bitte Filament manuell auswählen",
+    "eventTypes": {
+      "print_consumption": "Druck",
+      "move_location": "Verschoben",
+      "measurement": "Gewogen",
+      "manual_adjust": "Anpassung",
+      "opened": "Geöffnet",
+      "empty": "Aufgebraucht"
+    }
   },
   "colors": {
     "title": "Farben verwalten",

@@ -602,7 +602,15 @@
     "importFromTagNoDevices": "Žiadne aktívne zariadenia nie sú dostupné. Zapnite a pripojte zariadenie.",
     "importFromTagNoMatch": "Nenašiel sa zodpovedajúci filament pre",
     "importFromTagMatched": "Filament zistený",
-    "importFromTagSelectManually": "Vyberte filament manuálne"
+    "importFromTagSelectManually": "Vyberte filament manuálne",
+    "eventTypes": {
+      "print_consumption": "Tlač",
+      "move_location": "Presun",
+      "measurement": "Váženie",
+      "manual_adjust": "Ručná úprava",
+      "opened": "Otvorenie",
+      "empty": "Minutá"
+    }
   },
   "colors": {
     "title": "Spravovať farby",

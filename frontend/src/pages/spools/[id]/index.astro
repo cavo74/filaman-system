@@ -590,7 +590,7 @@ const { id } = Astro.params
       tbody.innerHTML = events.map((e: any) => `
         <tr>
           <td style="padding: 12px;">
-            <span class="fm-pill" style="${getEventTypeStyle(e.event_type)}">${e.event_type}</span>
+            <span class="fm-pill" style="${getEventTypeStyle(e.event_type)}">${eventTypeLabel(e.event_type)}</span>
           </td>
           <td style="padding: 12px; font-size: 0.85rem; color: var(--text-muted);">
             ${new Date(e.event_at).toLocaleString()}
@@ -604,6 +604,12 @@ const { id } = Astro.params
       `).join('')
     }
     
+    function eventTypeLabel(type: any) {
+      const key = `spools.eventTypes.${type}`
+      const label = t(key)
+      return label === key ? type : label
+    }
+
     function getEventTypeStyle(type: any) {
       const styles = {
         measurement: 'border-color: var(--accent-2); color: var(--accent-2);',

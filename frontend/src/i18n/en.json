@@ -611,7 +611,15 @@
     "importFromTagNoDevices": "No active devices available. Please switch on and connect a device.",
     "importFromTagNoMatch": "No matching filament found for",
     "importFromTagMatched": "Filament detected",
-    "importFromTagSelectManually": "Please select filament manually"
+    "importFromTagSelectManually": "Please select filament manually",
+    "eventTypes": {
+      "print_consumption": "Print",
+      "move_location": "Moved",
+      "measurement": "Weighed",
+      "manual_adjust": "Adjusted",
+      "opened": "Opened",
+      "empty": "Emptied"
+    }
   },
   "colors": {
     "title": "Manage Colors",
