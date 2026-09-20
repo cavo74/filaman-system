@@ -11,10 +11,12 @@
 import en from '../i18n/en.json'
 import de from '../i18n/de.json'
 import sk from '../i18n/sk.json'
+// French (fr) locale — contributed by Nanostra (Frédéric Dubus)
+import fr from '../i18n/fr.json'
 
 type Dict = Record<string, any>
 
-const dictionaries: Record<string, Dict> = { en, de, sk }
+const dictionaries: Record<string, Dict> = { en, de, sk, fr }
 const FALLBACK = 'en'
 
 let currentLang: string = 'en'

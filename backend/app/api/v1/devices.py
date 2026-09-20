@@ -1,16 +1,45 @@
+from ipaddress import ip_address
 import logging
 
 import httpx
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import DBSession
+from app.api.deps import (
+    DBSession,
+    PrincipalDep,
+    RequirePermission,
+    ensure_any_permission,
+)
 from app.utils.colors import visible_rgb_hex_or_legacy
 
 logger = logging.getLogger(__name__)
+
+
+def _device_url(address: str, path: str) -> httpx.URL:
+    try:
+        parsed = ip_address(address)
+    except ValueError:
+        parsed = None
+    if (
+        parsed is None
+        or parsed.is_unspecified
+        or parsed.is_loopback
+        or parsed.is_link_local
+        or parsed.is_multicast
+        or parsed.is_reserved
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "unsafe_device_address",
+                "message": "Device address is not allowed for outbound requests",
+            },
+        )
+    return httpx.URL(scheme="http", host=str(parsed), path=path)
 
 
 def _is_primary_worker() -> bool:
@@ -112,41 +141,23 @@ router = APIRouter(prefix="/devices", tags=["devices"])
 
 async def get_current_device(
     db: DBSession,
-    authorization: str = Header(..., alias="Authorization"),
+    principal: PrincipalDep,
 ) -> Device:
-    # Parse "Device <token>"
-    if not authorization.startswith("Device "):
+    if principal.auth_type != "device" or principal.device_id is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "unauthenticated", "message": "Invalid authorization header"},
+            detail={"code": "unauthenticated", "message": "Device authentication required"},
         )
-    
-    token = authorization[7:] # Remove "Device "
-    
-    # Use existing logic from middleware to parse token
-    from app.core.security import parse_token
-    parsed = parse_token(token)
-    if parsed is None or parsed[0] != "dev":
-         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail={"code": "unauthenticated", "message": "Invalid token format"},
-        )
-    
-    _, device_id, _ = parsed
-    
-    result = await db.execute(select(Device).where(Device.id == device_id))
+
+    result = await db.execute(select(Device).where(Device.id == principal.device_id))
     device = result.scalar_one_or_none()
-    
+
     if not device or not device.is_active or device.deleted_at:
-         raise HTTPException(
+        raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail={"code": "unauthenticated", "message": "Device not found or inactive"},
         )
-    
-    # Update last_used_at
-    device.last_used_at = datetime.now(timezone.utc)
-    await db.commit()
-    
+
     return device
 
 
@@ -187,7 +198,7 @@ async def device_heartbeat(
     db: DBSession,
     device: Device = Depends(get_current_device),
 ):
-    device.ip_address = data.ip_address
+    device.ip_address = str(data.ip_address)
     device.last_seen_at = datetime.now(timezone.utc)
     await db.commit()
     return {"status": "ok"}
@@ -196,6 +207,7 @@ async def device_heartbeat(
 @router.get("/active", response_model=list[dict])
 async def list_active_devices(
     db: DBSession,
+    principal=RequirePermission("spools:read"),
 ):
     # Find active devices (last seen < 3 min)
     now = datetime.now(timezone.utc)
@@ -228,7 +240,21 @@ async def write_rfid_tag(
     device_id: int,
     data: WriteTagRequest,
     db: DBSession,
+    principal: PrincipalDep,
 ):
+    if data.spool_id:
+        await ensure_any_permission(db, principal, "spools:update")
+    elif data.location_id:
+        await ensure_any_permission(db, principal, "locations:update")
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "bad_request",
+                "message": "Either spool_id or location_id must be provided",
+            },
+        )
+
     # Find Device
     result = await db.execute(select(Device).where(Device.id == device_id))
     device = result.scalar_one_or_none()
@@ -240,17 +266,12 @@ async def write_rfid_tag(
         )
 
     # Prepare request to device
-    device_url = f"http://{device.ip_address}/api/v1/rfid/write"
+    device_url = _device_url(device.ip_address, "/api/v1/rfid/write")
     payload = {}
     if data.spool_id:
         payload["spool_id"] = data.spool_id
-    elif data.location_id:
-        payload["location_id"] = data.location_id
     else:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "bad_request", "message": "Either spool_id or location_id must be provided"},
-        )
+        payload["location_id"] = data.location_id
 
     # Extended Data: nur wenn Spool und Setting aktiv
     if data.spool_id:
@@ -280,7 +301,10 @@ async def write_rfid_tag(
     new_custom_fields = dict(device.custom_fields)
     new_custom_fields["last_write_result"] = {
         "status": "pending",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        # Consumed by /rfid-result: which slot the chip replaces when both are full.
+        "spool_id": data.spool_id,
+        "replace_slot": data.replace_slot,
     }
     device.custom_fields = new_custom_fields
     await db.commit()
@@ -297,7 +321,7 @@ async def write_rfid_tag(
             timeout=5.0,  # Short timeout just to trigger the device
             http2=False,
             headers=headers,
-            follow_redirects=True,
+            follow_redirects=False,
         ) as client:
             # Fire and forget - we don't wait for the RFID result
             await client.post(device_url, json=payload)
@@ -317,6 +341,7 @@ async def write_rfid_tag(
 async def get_write_status(
     device_id: int,
     db: DBSession,
+    principal=RequirePermission("spools:read"),
 ):
     """
     Fragt den Status des letzten Schreibvorgangs für ein Gerät ab.
@@ -377,75 +402,89 @@ async def device_rfid_result(
         await db.commit()
         return RfidResultResponse(status="error", message="No tag_uuid provided")
 
-    # Duplicate check and cleanup - clear rfid_uid from ALL spools (incl. archived)
-    # to prevent UNIQUE constraint violation on spools.rfid_uid.
-    # Case-insensitive: the weigh lookup matches UIDs via lower(), so a UID stored
-    # with different casing would otherwise survive cleanup and later cause
-    # MultipleResultsFound on weigh.
-    removed_info = []
-    
-    # Check spools - all spools regardless of status
-    spool_query = (
-        select(Spool)
-        .where(func.lower(Spool.rfid_uid) == data.tag_uuid.lower())
-    )
-    if data.spool_id:
-        spool_query = spool_query.where(Spool.id != data.spool_id)
-    
-    spools_res = await db.execute(spool_query)
-    for s in spools_res.scalars().all():
-        removed_info.append(f"Spule #{s.id}")
-        s.rfid_uid = None
-        logger.info(f"Cleared duplicate RFID UID from spool {s.id}")
+    # A spool has two RFID slots. Writing a tag ADDS the chip to the first free
+    # slot (a Bambu spool carries one chip per side); the service steals the UID
+    # from any other spool/location first so the unique indexes never trip.
+    # If both slots are taken the secondary is replaced: the chip has already
+    # been written physically, so refusing here would desync DB and chip.
+    service = SpoolService(db)
+    removed_info: list[str] = []
 
-    # Check locations
-    loc_query = select(Location).where(Location.identifier == data.tag_uuid)
-    if data.location_id:
-        loc_query = loc_query.where(Location.id != data.location_id)
-    
-    locs_res = await db.execute(loc_query)
-    for l in locs_res.scalars().all():
-        removed_info.append(f"Standort '{l.name}'")
-        l.identifier = None
-        logger.info(f"Cleared duplicate identifier from location {l.id}")
+    # Slot chosen in the write-tag request (UI "replace tag 1/2"), if any.
+    pending = (device.custom_fields or {}).get("last_write_result") or {}
+    replace_slot = None
+    if (
+        pending.get("status") == "pending"
+        and data.spool_id
+        and pending.get("spool_id") == data.spool_id
+    ):
+        replace_slot = pending.get("replace_slot")
 
-    if removed_info:
-        write_result["removed_from"] = ", ".join(removed_info)
-    
-    # Determine target: spool_id OR tag_uuid (find spool by tag_uuid if no spool_id provided)
     target_spool = None
     target_location = None
-    
-    # Try to find spool by spool_id first, then by tag_uuid
+    # Only a spool explicitly targeted by spool_id keeps the chip when the same
+    # write also (re)assigns a location; a spool merely *found* by the UID is a
+    # previous owner and must lose it.
+    assigned_spool_id: int | None = None
+
     if data.spool_id:
         spool_res = await db.execute(select(Spool).where(Spool.id == data.spool_id))
         target_spool = spool_res.scalar_one_or_none()
         if target_spool:
-            target_spool.rfid_uid = data.tag_uuid
-            logger.info(f"Updated spool {data.spool_id} with RFID UID {data.tag_uuid}")
+            assigned_spool_id = target_spool.id
+            change = await service.add_rfid_uid(
+                target_spool,
+                data.tag_uuid,
+                replace_secondary=True,
+                replace_slot=replace_slot,
+            )
+            removed_info.extend(change.removed_from)
+            if change.replaced_uid:
+                removed_info.append(
+                    f"Spule #{target_spool.id} ({change.replaced_slot}. Tag "
+                    f"{change.replaced_uid} ersetzt)"
+                )
+            if change.already_assigned:
+                logger.info(f"Spool {data.spool_id} already has RFID UID {data.tag_uuid}")
+            else:
+                logger.info(
+                    f"Added RFID UID {data.tag_uuid} to spool {data.spool_id} "
+                    f"(slots now {target_spool.rfid_uid!r}, {target_spool.rfid_uid_2!r})"
+                )
         else:
             write_result["status"] = "error"
             write_result["error_message"] = "Target spool not found"
     elif data.tag_uuid:
-        # No spool_id provided, try to find spool by tag_uuid
-        spool_res = await db.execute(select(Spool).where(Spool.rfid_uid == data.tag_uuid))
-        target_spool = spool_res.scalar_one_or_none()
+        # No spool_id provided, try to find spool by tag_uuid (either slot)
+        target_spool = await service.find_spool_by_rfid(data.tag_uuid)
         if target_spool:
             logger.info(f"Found spool {target_spool.id} by tag_uuid {data.tag_uuid}")
         else:
             # Spool not found by tag_uuid - this is expected for new spools without tags
             logger.info(f"No spool found with tag_uuid {data.tag_uuid}")
-    
+
     # Handle location
     if data.location_id:
         loc_res = await db.execute(select(Location).where(Location.id == data.location_id))
         target_location = loc_res.scalar_one_or_none()
         if target_location:
+            removed_info.extend(
+                await service.release_rfid_uid(
+                    data.tag_uuid,
+                    exclude_spool_id=assigned_spool_id,
+                    exclude_location_id=target_location.id,
+                )
+            )
             target_location.identifier = data.tag_uuid
             logger.info(f"Updated location {data.location_id} with identifier {data.tag_uuid}")
         else:
             write_result["status"] = "error"
             write_result["error_message"] = "Target location not found"
+
+    for owner in removed_info:
+        logger.info(f"RFID UID {data.tag_uuid} removed from {owner}")
+    if removed_info:
+        write_result["removed_from"] = ", ".join(removed_info)
 
     # Update spool weight if provided (e.g., when writing tag to new spool)
     if data.remaining_weight_g is not None:
@@ -456,10 +495,7 @@ async def device_rfid_result(
             spool_to_update = target_spool
         elif data.tag_uuid:
             # Try to find spool by tag_uuid (might have been assigned above or already existed)
-            spool_res = await db.execute(
-                select(Spool).where(Spool.rfid_uid == data.tag_uuid)
-            )
-            spool_to_update = spool_res.scalar_one_or_none()
+            spool_to_update = await service.find_spool_by_rfid(data.tag_uuid)
         
         if not spool_to_update and data.spool_id:
             spool_res = await db.execute(
@@ -468,8 +504,21 @@ async def device_rfid_result(
             spool_to_update = spool_res.scalar_one_or_none()
         
         if spool_to_update:
-            spool_to_update.remaining_weight_g = data.remaining_weight_g
-            logger.info(f"Updated spool {spool_to_update.id} remaining weight to {data.remaining_weight_g}g")
+            # Older firmware sent the gross scale reading here as "remaining".
+            # Prefer /scale/weight for tara-aware remaining + Opened + pending.
+            # Only seed remaining when the spool has none yet.
+            if spool_to_update.remaining_weight_g is None:
+                spool_to_update.remaining_weight_g = data.remaining_weight_g
+                logger.info(
+                    f"Seeded spool {spool_to_update.id} remaining weight to "
+                    f"{data.remaining_weight_g}g from rfid-result"
+                )
+            else:
+                logger.info(
+                    f"Ignoring rfid-result remaining_weight_g="
+                    f"{data.remaining_weight_g} for spool {spool_to_update.id} "
+                    f"(already {spool_to_update.remaining_weight_g}g; use scale/weight)"
+                )
         else:
             logger.warning(f"Could not find spool to update weight for tag_uuid {data.tag_uuid}, spool_id {data.spool_id}")
 
@@ -575,6 +624,7 @@ async def weigh_spool(
     # Auto-assign: if device has auto_assign_enabled, notify all running drivers.
     # Drivers only live on the primary Gunicorn worker; proxy if we're not it.
     logger.debug(f"Auto-assign check: device={device.name} (id={device.id}), auto_assign_enabled={device.auto_assign_enabled}")
+    pending_armed = False
     if device.auto_assign_enabled:
         try:
             from app.plugins.manager import plugin_manager
@@ -587,6 +637,11 @@ async def weigh_spool(
                 "material_type": filament_material_type,
                 "color": base_color,
             }
+            # Prefer the chip UID from this weigh request so pending RFID match
+            # works even when /rfid-result has not committed spools.rfid_uid yet
+            # (common right after Write Tag).
+            if data.tag_uuid:
+                base_filament_data["rfid_uid"] = data.tag_uuid
 
             timeout = device.auto_assign_timeout or 60
 
@@ -605,9 +660,18 @@ async def weigh_spool(
                         filament_data=enriched_data,
                         timeout_seconds=timeout,
                     )
+                    pending_armed = True
                     logger.info(f"Auto-assign: pending spool {spool.id} on printer {printer_id} (timeout: {timeout}s)")
                 except Exception as e:
                     logger.error(f"Auto-assign failed for printer {printer_id}: {e}")
+            if not pending_armed:
+                logger.warning(
+                    f"Auto-assign: spool {spool.id} weighed/opened on device "
+                    f"'{device.name}' but no driver armed pending "
+                    f"(drivers={list(plugin_manager.drivers.keys())}, "
+                    f"primary_worker={_is_primary_worker()}). "
+                    f"AMS insert will not auto-assign until another weigh on the primary worker."
+                )
         except Exception as e:
             logger.error(f"Auto-assign error: {e}")
     else:
@@ -680,6 +744,7 @@ async def locate_spool(
 async def request_tag_scan(
     device_id: int,
     db: DBSession,
+    principal=RequirePermission("spools:create"),
 ):
     """Fordert das Gerät auf, den nächsten NFC-Tag zu lesen und die Daten zurückzusenden."""
     result = await db.execute(select(Device).where(Device.id == device_id))
@@ -690,6 +755,8 @@ async def request_tag_scan(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={"code": "not_found", "message": "Device not found, inactive or has no IP address"},
         )
+
+    device_url = _device_url(device.ip_address, "/api/v1/rfid/scan-request")
 
     # Status auf pending setzen
     if device.custom_fields is None:
@@ -703,10 +770,9 @@ async def request_tag_scan(
     await db.commit()
 
     # Scan-Request ans Gerät senden und Ergebnis prüfen
-    device_url = f"http://{device.ip_address}/api/v1/rfid/scan-request"
     request_error: str | None = None
     try:
-        async with httpx.AsyncClient(timeout=5.0, http2=False, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=5.0, http2=False, follow_redirects=False) as client:
             response = await client.post(device_url, json={})
 
         if response.status_code >= 400:
@@ -801,6 +867,7 @@ async def receive_tag_data(
 async def get_tag_scan_result(
     device_id: int,
     db: DBSession,
+    principal=RequirePermission("spools:read"),
 ):
     """Gibt den Status und das Ergebnis des letzten Tag-Scans zurück."""
     result = await db.execute(select(Device).where(Device.id == device_id))

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
@@ -45,9 +46,13 @@ from app.models import (
     Spool,
     SpoolEvent,
     SpoolStatus,
-    SystemExtraField,
+)
+from app.services.custom_field_search import (
+    any_custom_field_matches,
+    searchable_custom_field_keys,
 )
 from app.services.spool_service import SpoolService
+from app.utils.query_params import parse_multi_int, parse_multi_str
 
 
 async def _reject_driver_managed_create_location(
@@ -237,6 +242,23 @@ async def delete_location(
 router_spools = APIRouter(prefix="/spools", tags=["spools"])
 
 
+class SpoolFilterOption(BaseModel):
+    value: str
+    label: str
+
+
+class SpoolFilterScope(BaseModel):
+    manufacturers: list[SpoolFilterOption]
+    materials: list[str]
+    locations: list[SpoolFilterOption]
+    has_empty_location: bool
+
+
+class SpoolFilterOptionsResponse(BaseModel):
+    used_status_ids: list[int]
+    by_status: dict[str, SpoolFilterScope]
+
+
 @router_spools.get("/statuses", response_model=list[SpoolStatusResponse])
 async def list_spool_statuses(
     db: DBSession,
@@ -254,17 +276,93 @@ async def list_spool_statuses(
     return serialized
 
 
+@router_spools.get("/filter-options", response_model=SpoolFilterOptionsResponse)
+async def list_spool_filter_options(db: DBSession, principal: PrincipalDep):
+    """Return spool-backed categorical values grouped by status in one query."""
+    cached = response_cache.get("filter_options:spools")
+    if cached is not None:
+        return cached
+
+    result = await db.execute(
+        select(
+            Spool.status_id,
+            Filament.manufacturer_id,
+            Manufacturer.name,
+            Filament.material_type,
+            Spool.location_id,
+            Location.name,
+        )
+        .join(Filament, Filament.id == Spool.filament_id)
+        .join(Manufacturer, Manufacturer.id == Filament.manufacturer_id)
+        .outerjoin(Location, Location.id == Spool.location_id)
+        .distinct()
+    )
+
+    scopes: dict[int, dict[str, Any]] = {}
+    for (
+        status_id,
+        manufacturer_id,
+        manufacturer_name,
+        material,
+        location_id,
+        location_name,
+    ) in result.all():
+        scope = scopes.setdefault(
+            status_id,
+            {
+                "manufacturers": {},
+                "materials": set(),
+                "locations": {},
+                "has_empty_location": False,
+            },
+        )
+        scope["manufacturers"][manufacturer_id] = manufacturer_name
+        if material:
+            scope["materials"].add(material)
+        if location_id is None:
+            scope["has_empty_location"] = True
+        else:
+            scope["locations"][location_id] = location_name
+
+    by_status: dict[str, SpoolFilterScope] = {}
+    for status_id, scope in scopes.items():
+        by_status[str(status_id)] = SpoolFilterScope(
+            manufacturers=[
+                SpoolFilterOption(value=str(option_id), label=label)
+                for option_id, label in sorted(
+                    scope["manufacturers"].items(), key=lambda item: item[1].casefold()
+                )
+            ],
+            materials=sorted(scope["materials"], key=str.casefold),
+            locations=[
+                SpoolFilterOption(value=str(option_id), label=label)
+                for option_id, label in sorted(
+                    scope["locations"].items(), key=lambda item: item[1].casefold()
+                )
+            ],
+            has_empty_location=scope["has_empty_location"],
+        )
+
+    payload = SpoolFilterOptionsResponse(
+        used_status_ids=sorted(scopes),
+        by_status=by_status,
+    )
+    response_cache.set("filter_options:spools", payload, ttl=300)
+    return payload
+
+
 @router_spools.get("", response_model=PaginatedResponse[SpoolResponse])
 async def list_spools(
     db: DBSession,
     principal: PrincipalDep,
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
-    filament_id: int | None = None,
-    status_id: int | None = None,
-    location_id: int | None = None,
-    manufacturer_id: int | None = None,
-    type: str | None = None,
+    filament_id: list[str] | None = Query(None),
+    status_id: list[str] | None = Query(None),
+    location_id: list[str] | None = Query(None),
+    location_unassigned: bool = Query(False),
+    manufacturer_id: list[str] | None = Query(None),
+    type: list[str] | None = Query(None),
     include_archived: bool = Query(False),
     search: str | None = Query(None, max_length=200),
     sort_by: str = Query(
@@ -278,31 +376,49 @@ async def list_spools(
     needs_filament_join = False
     needs_status_join = False
     needs_manufacturer_join = False
+    filament_ids = parse_multi_int(filament_id, "filament_id")
+    status_ids = parse_multi_int(status_id, "status_id")
+    location_ids = parse_multi_int(location_id, "location_id")
+    manufacturer_ids = parse_multi_int(manufacturer_id, "manufacturer_id")
+    material_types = parse_multi_str(type, "type")
 
-    if manufacturer_id:
-        conditions.append(Filament.manufacturer_id == manufacturer_id)
+    if manufacturer_ids:
+        conditions.append(Filament.manufacturer_id.in_(manufacturer_ids))
         needs_filament_join = True
-    if filament_id:
-        conditions.append(Spool.filament_id == filament_id)
-    if type:
-        conditions.append(Filament.material_type == type)
+    if filament_ids:
+        conditions.append(Spool.filament_id.in_(filament_ids))
+    if material_types:
+        conditions.append(Filament.material_type.in_(material_types))
         needs_filament_join = True
 
     if include_archived:
-        if status_id:
-            conditions.append(Spool.status_id == status_id)
+        if status_ids:
+            conditions.append(Spool.status_id.in_(status_ids))
         # else: no filter — include all spools (archived + non-archived)
-    elif status_id:
-        conditions.append(Spool.status_id == status_id)
+    elif status_ids:
+        conditions.append(Spool.status_id.in_(status_ids))
     else:
         conditions.append(SpoolStatus.key != "archived")
         needs_status_join = True
 
-    if location_id:
-        conditions.append(Spool.location_id == location_id)
+    if location_ids and location_unassigned:
+        conditions.append(or_(Spool.location_id.in_(location_ids), Spool.location_id.is_(None)))
+    elif location_ids:
+        conditions.append(Spool.location_id.in_(location_ids))
+    elif location_unassigned:
+        conditions.append(Spool.location_id.is_(None))
 
     if search:
         search_term = f"%{search}%"
+        # RFID: match either slot and ignore common hex separators, without
+        # changing the spelling stored in either column.
+        compact_term = f"%{search.replace(':', '').replace('-', '').replace(' ', '')}%"
+        compact_primary = func.replace(
+            func.replace(func.replace(Spool.rfid_uid, ":", ""), "-", ""), " ", ""
+        )
+        compact_secondary = func.replace(
+            func.replace(func.replace(Spool.rfid_uid_2, ":", ""), "-", ""), " ", ""
+        )
         or_conditions = [
             Filament.designation.ilike(search_term),
             Filament.material_type.ilike(search_term),
@@ -310,6 +426,9 @@ async def list_spools(
             Manufacturer.name.ilike(search_term),
             Spool.lot_number.ilike(search_term),
             Spool.rfid_uid.ilike(search_term),
+            Spool.rfid_uid_2.ilike(search_term),
+            compact_primary.ilike(compact_term),
+            compact_secondary.ilike(compact_term),
         ]
 
         # Match on the spool ID (optionally entered with a leading '#')
@@ -317,21 +436,21 @@ async def list_spools(
         if id_search.isdigit() and len(id_search) <= 18:
             or_conditions.append(Spool.id == int(id_search))
 
-        # Match on the *values* of defined spool extra fields (custom_fields JSON).
-        # custom_fields[key].as_string() compiles to json_extract(..., '$.key')
-        # on SQLite and custom_fields ->> 'key' on Postgres, so only values are
-        # searched, not the field keys themselves.
-        ef_keys = (
-            await db.execute(
-                select(SystemExtraField.key).where(
-                    SystemExtraField.target_type == "spool"
-                )
+        # Match on the *values* of extra fields — never on the field keys. A
+        # field counts whether it is defined system-wide, only on the record
+        # (custom_field_definitions) or not at all, and filament fields count
+        # too because the filament is already joined here (issue #147).
+        dialect = db.get_bind().dialect.name
+        for column, table, target_type in (
+            (Spool.custom_fields, "spools", "spool"),
+            (Filament.custom_fields, "filaments", "filament"),
+        ):
+            keys = await searchable_custom_field_keys(
+                db, table=table, target_type=target_type
             )
-        ).scalars().all()
-        for key in ef_keys:
-            or_conditions.append(
-                Spool.custom_fields[key].as_string().ilike(search_term)
-            )
+            match = any_custom_field_matches(column, keys, search, dialect=dialect)
+            if match is not None:
+                or_conditions.append(match)
 
         conditions.append(or_(*or_conditions))
         needs_filament_join = True
@@ -469,16 +588,19 @@ async def create_spool(
     if "status_id" not in spool_data or spool_data["status_id"] is None:
         spool_data["status_id"] = status_obj.id
 
-    # Clear rfid_uid from other spools to prevent UNIQUE constraint violation
-    new_rfid = spool_data.get("rfid_uid")
-    if new_rfid:
-        dup_result = await db.execute(select(Spool).where(Spool.rfid_uid == new_rfid))
-        for dup in dup_result.scalars().all():
-            dup.rfid_uid = None
+    # RFID slots go through the service: stored as submitted, compared
+    # without regard to hex spelling, and stolen from any other owner.
+    rfid_primary = spool_data.pop("rfid_uid", None)
+    rfid_secondary = spool_data.pop("rfid_uid_2", None)
 
     next_id = await get_next_available_id(db, Spool)
     spool = Spool(id=next_id, **spool_data)
     db.add(spool)
+    await db.flush()
+    if rfid_primary or rfid_secondary:
+        await SpoolService(db).set_rfid_uids(
+            spool, rfid_uid=rfid_primary, rfid_uid_2=rfid_secondary
+        )
     await db.commit()
     await event_bus.publish({"event": "spools_changed"})
 
@@ -561,26 +683,28 @@ async def create_spools_bulk(
         spool_data["status_id"] = status_obj.id
 
     # Unique fields cannot be duplicated across multiple spools
+    rfid_primary = spool_data.pop("rfid_uid", None)
+    rfid_secondary = spool_data.pop("rfid_uid_2", None)
     if data.quantity > 1:
-        spool_data["rfid_uid"] = None
+        rfid_primary = None
+        rfid_secondary = None
         spool_data["external_id"] = None
-
-    # Clear rfid_uid from other spools to prevent UNIQUE constraint violation
-    new_rfid = spool_data.get("rfid_uid")
-    if new_rfid:
-        dup_result = await db.execute(select(Spool).where(Spool.rfid_uid == new_rfid))
-        for dup in dup_result.scalars().all():
-            dup.rfid_uid = None
 
     next_ids = await get_next_available_ids(db, Spool, data.quantity)
     spool_ids = []
     try:
+        created: list[Spool] = []
         for i in range(data.quantity):
             spool = Spool(id=next_ids[i], **spool_data.copy())
             db.add(spool)
+            created.append(spool)
             spool_ids.append(next_ids[i])
 
         await db.flush()
+        if rfid_primary or rfid_secondary:
+            await SpoolService(db).set_rfid_uids(
+                created[0], rfid_uid=rfid_primary, rfid_uid_2=rfid_secondary
+            )
         await db.commit()
     except Exception as e:
         await db.rollback()
@@ -758,15 +882,15 @@ async def update_spool(
             detail={"code": "not_found", "message": "Spool not found"},
         )
 
-    # Clear rfid_uid from other spools to prevent UNIQUE constraint violation
     update_data = data.model_dump(exclude_unset=True)
-    new_rfid = update_data.get("rfid_uid")
-    if new_rfid and new_rfid != spool.rfid_uid:
-        dup_result = await db.execute(
-            select(Spool).where(Spool.rfid_uid == new_rfid, Spool.id != spool_id)
-        )
-        for dup in dup_result.scalars().all():
-            dup.rfid_uid = None
+
+    # RFID slots are applied through the service after the plain fields:
+    # stored as submitted, deduplicated, stolen from other owners, primary back-filled.
+    rfid_kwargs = {
+        key: update_data.pop(key)
+        for key in ("rfid_uid", "rfid_uid_2")
+        if key in update_data
+    }
 
     # Capture pre-update tara/remaining for tara-change propagation
     tara_in_payload = "empty_spool_weight_g" in update_data
@@ -775,6 +899,9 @@ async def update_spool(
 
     for key, value in update_data.items():
         setattr(spool, key, value)
+
+    if rfid_kwargs:
+        await SpoolService(db).set_rfid_uids(spool, **rfid_kwargs)
 
     # If tara (empty_spool_weight_g) changed on a spool that has a remaining
     # weight, shift remaining by -delta_tara so the brutto (initial_total_weight_g)
@@ -894,12 +1021,14 @@ async def permanently_delete_spool(
 async def change_statuses_bulk(
     data: BulkStatusChangeRequest,
     db: DBSession,
-    principal: PrincipalDep,
+    principal=RequirePermission("spool_events:create_status"),
 ):
-    """Change status for multiple spools (e.g. bulk archiving)."""
+    """Change status for multiple spools (e.g. bulk archiving).
+
+    Requires the same permission as the single-spool POST /{spool_id}/status:
+    what a role may not do one spool at a time it may not do in bulk either.
+    """
     service = SpoolService(db)
-    # Check permission (using a general update permission for now, or create a specific one if needed)
-    RequirePermission("spools:update")
 
     count = await service.change_statuses_bulk(
         spool_ids=data.spool_ids,
