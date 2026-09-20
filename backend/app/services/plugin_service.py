@@ -628,6 +628,8 @@ class PluginInstallService:
         page_url: str | None = None,
         homepage: str | None = None,
         show_in_nav: bool = False,
+        driver_key: str | None = None,
+        config_schema: dict[str, Any] | None = None,
     ) -> InstalledPlugin:
         """Ein eingebautes Plugin registrieren (kein ZIP noetig).
 
@@ -647,6 +649,8 @@ class PluginInstallService:
             existing.page_url = page_url
             existing.homepage = homepage
             existing.show_in_nav = show_in_nav
+            existing.driver_key = driver_key
+            existing.config_schema = config_schema
             await self.db.commit()
             await self.db.refresh(existing)
             return existing
@@ -661,6 +665,8 @@ class PluginInstallService:
             page_url=page_url,
             homepage=homepage,
             show_in_nav=show_in_nav,
+            driver_key=driver_key,
+            config_schema=config_schema,
             is_active=True,
         )
         self.db.add(plugin)

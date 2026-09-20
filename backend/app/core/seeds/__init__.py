@@ -1,6 +1,8 @@
+import json
 import logging
 import shutil
 import sys
+from pathlib import Path
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,6 +14,19 @@ from app.models.plugin import InstalledPlugin
 from app.services.plugin_service import PLUGINS_DIR, PluginInstallService
 
 logger = logging.getLogger(__name__)
+
+
+def _load_builtin_driver_config_schema(driver_key: str) -> dict | None:
+    """Read a bundled driver's own plugin.json instead of duplicating its schema here."""
+    manifest_path = (
+        Path(__file__).parent.parent.parent / "plugins" / driver_key / "plugin.json"
+    )
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            return json.load(f).get("config_schema")
+    except Exception:
+        logger.warning("Could not load config_schema for builtin driver '%s'", driver_key)
+        return None
 
 
 SPOOL_STATUSES = [
@@ -421,6 +436,19 @@ BUILTIN_PLUGINS = [
         "page_url": "/admin/system/filamentdb-import",
         "show_in_nav": True,
     },
+    {
+        "plugin_key": "prusa_mk4",
+        "name": "Prusa MK4 (PrusaLink)",
+        "version": "1.0.0",
+        "description": (
+            "Connects a Prusa MK4/MK4S/MK3.9 over PrusaLink's local HTTP API "
+            "for connection status, job/temperature telemetry and logical "
+            "spool assignment."
+        ),
+        "author": "FilaMan",
+        "plugin_type": "driver",
+        "driver_key": "prusa_mk4",
+    },
 ]
 
 
@@ -428,6 +456,10 @@ async def seed_builtin_plugins(db: AsyncSession) -> None:
     """Register built-in plugins so they appear in the plugin list."""
     svc = PluginInstallService(db)
     for plugin_data in BUILTIN_PLUGINS:
+        plugin_data = dict(plugin_data)
+        driver_key = plugin_data.get("driver_key")
+        if driver_key:
+            plugin_data["config_schema"] = _load_builtin_driver_config_schema(driver_key)
         await svc.register_builtin(**plugin_data)
 
 

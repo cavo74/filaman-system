@@ -76,9 +76,10 @@ Agents.md
 Claude.md
 .omo
 
-# Installed plugins (only spoolman_import ships as default)
+# Installed plugins (only spoolman_import and prusa_mk4 ship as default)
 backend/app/plugins/*/
 !backend/app/plugins/spoolman_import/
+!backend/app/plugins/prusa_mk4/
 
 # Video
 _video

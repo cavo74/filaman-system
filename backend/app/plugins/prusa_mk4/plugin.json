@@ -1,0 +1,37 @@
+{
+  "plugin_key": "prusa_mk4",
+  "name": "Prusa MK4 (PrusaLink)",
+  "version": "1.0.0",
+  "description": "Connects a Prusa MK4/MK4S/MK3.9 over PrusaLink's local HTTP API for connection status, job/temperature telemetry and logical spool assignment.",
+  "author": "FilaMan",
+  "plugin_type": "driver",
+  "driver_key": "prusa_mk4",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string",
+        "title": "IP address / hostname",
+        "description": "PrusaLink host, e.g. 192.168.1.50 (optionally host:port)"
+      },
+      "api_key": {
+        "type": "string",
+        "title": "PrusaLink API key",
+        "description": "Settings > Network > PrusaLink on the printer's touchscreen"
+      },
+      "use_https": {
+        "type": "boolean",
+        "title": "Use HTTPS",
+        "default": false
+      },
+      "poll_interval": {
+        "type": "integer",
+        "title": "Poll interval (s)",
+        "default": 5,
+        "minimum": 2,
+        "maximum": 60
+      }
+    },
+    "required": ["host", "api_key"]
+  }
+}
