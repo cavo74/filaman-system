@@ -120,6 +120,18 @@ class Driver(BaseDriver):
         if self._last_status:
             printer = self._last_status.get("printer") or {}
             base["state"] = printer.get("state")
+        # The spool-page "which printers currently hold me" widget only looks
+        # at connected printers whose health() carries a non-empty `slots`
+        # list (see PluginManager._handle_slots_update / spools/[id].astro),
+        # so MK4 needs one even outside a slots_update event.
+        base["slots"] = [{
+            "slot_index": _SLOT_INDEX,
+            "slot_kind": "toolhead",
+            "slot_name": "Extruder",
+            "present": self._assigned_spool_id is not None,
+            "tray_type": self._assigned_meta.get("tray_type"),
+            "tray_color": self._assigned_meta.get("tray_color"),
+        }]
         return base
 
     async def get_display_state(self) -> dict[str, Any] | None:
